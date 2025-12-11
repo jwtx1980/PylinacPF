@@ -2,19 +2,22 @@
 #!/usr/bin/env python3
 
 """
-Run pylinac PicketFence on all pf#.tif images in a folder,
-using numpy arrays and pylinac.core.image.Image to bypass pydicom.
+Run pylinac PicketFence on all pf#.tif images in a folder by normalizing them
+to numpy arrays and writing temporary DICOM files that pylinac can read.
 """
 
 import argparse
 import re
 import sys
+import tempfile
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageOps
 
-from pylinac.core.image import Image as PylinacImage
+import pydicom
+from pydicom.dataset import Dataset, FileDataset
 from pylinac.picketfence import PicketFence
 
 DEFAULT_REGEX = r"^pf\d+\.tif$"
@@ -29,7 +32,7 @@ def find_images(root: Path, pattern_regex: str, recursive: bool):
 
 
 def load_and_normalize(path: Path) -> np.ndarray:
-    """Load TIFF -> grayscale float32 array 0–1."""
+    """Load TIFF -> grayscale float32 array scaled 0-1."""
     img = Image.open(path)
 
     if img.mode not in ("L", "I;16"):
@@ -45,38 +48,72 @@ def load_and_normalize(path: Path) -> np.ndarray:
     return (arr - mn) / (mx - mn)
 
 
-def build_pylinac_image(arr: np.ndarray) -> PylinacImage:
-    """Construct a pylinac Image object that NEVER touches pydicom."""
-    # The Image class accepts raw numpy
-    img = PylinacImage(arr)
+def write_array_to_dicom(arr: np.ndarray, path: Path) -> Path:
+    """Persist the array to a minimal DICOM file for pylinac to read."""
+    arr_uint16 = np.clip(arr, 0, 1)
+    arr_uint16 = (arr_uint16 * np.iinfo(np.uint16).max).astype(np.uint16)
 
-    # Ensure metadata required by PicketFence exists
-    # (pixel spacing defaults to 1 if missing, which is fine)
-    if not hasattr(img, "dpmm"):
-        # fake dpmm to avoid NaN issues: assume 1 pixel = 1 mm
-        img._dpmm = 1.0
-    if not hasattr(img, "cax"):
-        img.cax = (arr.shape[1] // 2, arr.shape[0] // 2)
+    file_meta = Dataset()
+    file_meta.MediaStorageSOPClassUID = pydicom.uid.SecondaryCaptureImageStorage
+    file_meta.MediaStorageSOPInstanceUID = pydicom.uid.generate_uid()
+    file_meta.TransferSyntaxUID = pydicom.uid.ExplicitVRLittleEndian
+    file_meta.ImplementationClassUID = pydicom.uid.PYDICOM_IMPLEMENTATION_UID
 
-    return img
+    ds = FileDataset(str(path), {}, file_meta=file_meta, preamble=b"\0" * 128)
+    ds.Modality = "RTIMAGE"
+    ds.SOPClassUID = file_meta.MediaStorageSOPClassUID
+    ds.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
+    ds.ContentDate = datetime.now().strftime("%Y%m%d")
+    ds.ContentTime = datetime.now().strftime("%H%M%S")
+    ds.Rows, ds.Columns = arr_uint16.shape
+    ds.SamplesPerPixel = 1
+    ds.PhotometricInterpretation = "MONOCHROME2"
+    ds.PixelSpacing = [1.0, 1.0]
+    ds.BitsAllocated = 16
+    ds.BitsStored = 16
+    ds.HighBit = 15
+    ds.PixelRepresentation = 0
+    ds.RescaleIntercept = 0
+    ds.RescaleSlope = 1
+    ds.PixelData = arr_uint16.tobytes()
+
+    ds.save_as(path, write_like_original=False)
+    return Path(path)
 
 
-def run_picket_fence(arr: np.ndarray, tol: float, action: float) -> PicketFence:
-    """Run PicketFence on a numpy array via pylinac Image wrapper."""
-    image_obj = build_pylinac_image(arr)
-    pf = PicketFence(image_obj)
+def run_picket_fence(
+    arr: np.ndarray,
+    tol: float,
+    action: float,
+    *,
+    height_threshold: float,
+    required_prominence: float,
+    invert: bool,
+) -> PicketFence:
+    """Run PicketFence on a numpy array by writing a temporary DICOM file."""
+    with tempfile.NamedTemporaryFile(suffix=".dcm", delete=False) as tmp:
+        tmp_path = write_array_to_dicom(arr, Path(tmp.name))
 
-    # pylinac version differences: enforce tolerance ordering
-    if tol < action:
-        tol, action = action, tol
-
-    # many older versions require positional args only
+    pf = None
     try:
-        pf.analyze(tol, action)
-    except TypeError:
-        pf.analyze(tol)
+        pf = PicketFence(tmp_path)
 
-    return pf
+        if tol < action:
+            tol, action = action, tol
+
+        pf.analyze(
+            tol,
+            action,
+            height_threshold=height_threshold,
+            required_prominence=required_prominence,
+            invert=invert,
+        )
+        return pf
+    finally:
+        try:
+            tmp_path.unlink()
+        except Exception:
+            pass
 
 
 def main():
@@ -86,6 +123,9 @@ def main():
     ap.add_argument("--action", type=float, default=0.5)
     ap.add_argument("--recursive", action="store_true")
     ap.add_argument("--pattern", default=DEFAULT_REGEX)
+    ap.add_argument("--height-threshold", type=float, default=0.1)
+    ap.add_argument("--prominence", type=float, default=0.05)
+    ap.add_argument("--invert", action="store_true")
     args = ap.parse_args()
 
     if args.tol < args.action:
@@ -106,7 +146,14 @@ def main():
         print(f"Processing {tif.name}...")
         try:
             arr = load_and_normalize(tif)
-            pf = run_picket_fence(arr, args.tol, args.action)
+            pf = run_picket_fence(
+                arr,
+                args.tol,
+                args.action,
+                height_threshold=args.height_threshold,
+                required_prominence=args.prominence,
+                invert=args.invert,
+            )
 
             out_pdf = tif.with_name(f"{tif.stem}_PF.pdf")
             pf.publish_pdf(str(out_pdf))
