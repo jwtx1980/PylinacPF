@@ -4,6 +4,10 @@
 """
 Run pylinac PicketFence on all pf#.tif images in a folder by normalizing them
 to numpy arrays and writing temporary DICOM files that pylinac can read.
+
+Example with the optional preprocessing tweaks enabled:
+    python PylinacPF.py "PF Images" --invert --median-radius 3 --height-threshold 0.2 \
+        --prominence 0.1 --tol 0.8 --action 0.6
 """
 
 import argparse
