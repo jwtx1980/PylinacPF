@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageOps
+from PIL import Image, ImageFilter, ImageOps
 
 import pydicom
 from pydicom.dataset import Dataset, FileDataset
@@ -31,12 +31,15 @@ def find_images(root: Path, pattern_regex: str, recursive: bool):
             yield p
 
 
-def load_and_normalize(path: Path) -> np.ndarray:
-    """Load TIFF -> grayscale float32 array scaled 0-1."""
+def load_and_normalize(path: Path, *, invert: bool, median_radius: int) -> np.ndarray:
+    """Load TIFF -> grayscale float32 array scaled 0-1 with optional filtering."""
     img = Image.open(path)
 
     if img.mode not in ("L", "I;16"):
         img = ImageOps.grayscale(img)
+
+    if median_radius > 0:
+        img = img.filter(ImageFilter.MedianFilter(size=median_radius))
 
     arr = np.array(img).astype(np.float32)
 
@@ -45,7 +48,12 @@ def load_and_normalize(path: Path) -> np.ndarray:
     if mx == mn:
         raise ValueError("Image is uniform; cannot analyze.")
 
-    return (arr - mn) / (mx - mn)
+    arr = (arr - mn) / (mx - mn)
+
+    if invert:
+        arr = 1.0 - arr
+
+    return arr
 
 
 def write_array_to_dicom(arr: np.ndarray, path: Path) -> Path:
@@ -88,7 +96,6 @@ def run_picket_fence(
     *,
     height_threshold: float,
     required_prominence: float,
-    invert: bool,
 ) -> PicketFence:
     """Run PicketFence on a numpy array by writing a temporary DICOM file."""
     with tempfile.NamedTemporaryFile(suffix=".dcm", delete=False) as tmp:
@@ -106,7 +113,6 @@ def run_picket_fence(
             action,
             height_threshold=height_threshold,
             required_prominence=required_prominence,
-            invert=invert,
         )
         return pf
     finally:
@@ -125,7 +131,17 @@ def main():
     ap.add_argument("--pattern", default=DEFAULT_REGEX)
     ap.add_argument("--height-threshold", type=float, default=0.1)
     ap.add_argument("--prominence", type=float, default=0.05)
-    ap.add_argument("--invert", action="store_true")
+    ap.add_argument(
+        "--invert",
+        action="store_true",
+        help="Invert the normalized image to make darker leaf junctions appear as peaks.",
+    )
+    ap.add_argument(
+        "--median-radius",
+        type=int,
+        default=0,
+        help="Apply a median filter with the given radius before analysis to suppress thin leakage streaks.",
+    )
     args = ap.parse_args()
 
     if args.tol < args.action:
@@ -145,14 +161,15 @@ def main():
     for tif in sorted(tifs):
         print(f"Processing {tif.name}...")
         try:
-            arr = load_and_normalize(tif)
+            arr = load_and_normalize(
+                tif, invert=args.invert, median_radius=args.median_radius
+            )
             pf = run_picket_fence(
                 arr,
                 args.tol,
                 args.action,
                 height_threshold=args.height_threshold,
                 required_prominence=args.prominence,
-                invert=args.invert,
             )
 
             out_pdf = tif.with_name(f"{tif.stem}_PF.pdf")
