@@ -43,6 +43,8 @@ def load_and_normalize(path: Path, *, invert: bool, median_radius: int) -> np.nd
         img = ImageOps.grayscale(img)
 
     if median_radius > 0:
+        if img.mode != "F":
+            img = img.convert("F")
         img = img.filter(ImageFilter.MedianFilter(size=median_radius))
 
     arr = np.array(img).astype(np.float32)
